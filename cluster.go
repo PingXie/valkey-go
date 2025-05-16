@@ -769,6 +769,42 @@ func (c *clusterClient) doretry(
 	wg.Done()
 }
 
+func (c *clusterClient) BuildCrossSlotMGETs(ctx context.Context, keys []string) ([]Completed, error) {
+	commandsMap := make(map[conn]cmds.Arbitrary)
+
+	// Iterate over the keys in the command
+	// 1. compute their slots
+	// 2. look up the corresponding connections
+	// 3. look up the corresponding command; if the command exists, append the key to the command as argument
+	// 4. if the command does not exist, create a new Arbitrary command with MGET as the command name and the key as argument
+	for _, key := range keys {
+		slot := cmds.Slot(key)
+		// pick the connection for the slot based on the policy
+		conn := c._pick(slot, false)
+		if conn == nil {
+			// this should not happen since we already checked the slot in the pickMulti method
+			// but just in case, we return an Error
+			return nil, errors.New("no connection found for the slot")
+		}
+		if _, ok := commandsMap[conn]; !ok {
+			commandsMap[conn] = c.cmd.Arbitrary("MGET")
+			commandsMap[conn].Args(key)
+		} else {
+			commandsMap[conn].Args(key)
+		}
+	}
+
+	// Build the commands and explicitly set the slot for each command
+	commands := make([]Completed, 0, len(commandsMap))
+	for _, cmd := range commandsMap {
+		completed := cmd.Build()
+		completed.SetSlot(completed.Commands()[1])
+		commands = append(commands, completed)
+	}
+
+	return commands, nil
+}
+
 func (c *clusterClient) DoMulti(ctx context.Context, multi ...Completed) []ValkeyResult {
 	if len(multi) == 0 {
 		return nil

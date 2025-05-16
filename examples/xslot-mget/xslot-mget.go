@@ -39,7 +39,7 @@ func generateData(numKeys int, cycleNum int) (expectedKVs map[string]string, all
 	// Using a more unique component for keys across different runs/cycles if needed
 	uniqueComponent := time.Now().UnixNano()
 
-	for i := 0; i < numKeys; i++ {
+	for i :=  range numKeys {
 		key := fmt.Sprintf("%s_c%d_u%d_k%d", keyPrefix, cycleNum, uniqueComponent, i)
 		value := randString(valueLength)
 		expectedKVs[key] = value
@@ -274,9 +274,6 @@ func main() {
 	durationSec := flag.Int("duration", 10, "Test duration in seconds")
 	numKeys := flag.Int("numkeys", 10, "Number of keys to MGET per cycle")
 	flag.Parse()
-
-	// Seed random number generator once at the start.
-	rand.Seed(time.Now().UnixNano())
 
 	serverAddr := fmt.Sprintf("%s:%s", *host, *port)
 	fmt.Printf("Attempting to connect to Valkey server at: %s\n", serverAddr)

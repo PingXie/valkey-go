@@ -385,6 +385,10 @@ type CoreClient interface {
 	Close()
 }
 
+type CrossSlotClient interface {
+	BuildCrossSlotMGETs(ctx context.Context, keys []string) ([]Completed, error)
+}
+
 // CT is a shorthand constructor for CacheableTTL
 func CT(cmd Cacheable, ttl time.Duration) CacheableTTL {
 	return CacheableTTL{Cmd: cmd, TTL: ttl}

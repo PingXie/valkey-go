@@ -239,6 +239,16 @@ type ClientOption struct {
 	// EnableReplicaAZInfo enables the client to load the replica node's availability zone.
 	// If true, the client will set the `AZ` field in `ReplicaInfo`.
 	EnableReplicaAZInfo bool
+
+	// Enable cross-slot mget
+	// If true, the client will support cross-slot mget commands
+	EnableCrossSlotMGET bool
+
+	// Allow accessing unstable slots for cross-slot mget commands
+	// If true, the client will allow accessing unstable slots for cross-slot mget Commands
+	// If false, the client will only allow accessing stable slots for cross-slot mget Commands
+	// This option is ignored if EnableCrossSlotMGET is false
+	AllowUnstableSlotsForCrossSlotMGET bool
 }
 
 // SentinelOption contains MasterSet,

@@ -39,7 +39,7 @@ func generateData(numKeys int, cycleNum int) (expectedKVs map[string]string, all
 	// Using a more unique component for keys across different runs/cycles if needed
 	uniqueComponent := time.Now().UnixNano()
 
-	for i :=  range numKeys {
+	for i := range numKeys {
 		key := fmt.Sprintf("%s_c%d_u%d_k%d", keyPrefix, cycleNum, uniqueComponent, i)
 		value := randString(valueLength)
 		expectedKVs[key] = value
@@ -278,7 +278,11 @@ func main() {
 	serverAddr := fmt.Sprintf("%s:%s", *host, *port)
 	fmt.Printf("Attempting to connect to Valkey server at: %s\n", serverAddr)
 
-	client, err := valkey.NewClient(valkey.ClientOption{InitAddress: []string{serverAddr}})
+	client, err := valkey.NewClient(valkey.ClientOption{
+		InitAddress:                        []string{serverAddr},
+		EnableCrossSlotMGET:                true,
+		AllowUnstableSlotsForCrossSlotMGET: true,
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create Valkey client: %v\n", err)
 		os.Exit(1)

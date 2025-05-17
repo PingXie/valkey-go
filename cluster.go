@@ -770,6 +770,10 @@ func (c *clusterClient) doretry(
 }
 
 func (c *clusterClient) BuildCrossSlotMGETs(ctx context.Context, keys []string) ([]Completed, error) {
+	if c.opt.EnableCrossSlotMGET == false {
+		return nil, errors.New("cross slot MGET is not enabled")
+	}
+
 	commandsMap := make(map[conn]cmds.Arbitrary)
 
 	// Iterate over the keys in the command

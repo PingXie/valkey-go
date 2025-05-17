@@ -812,7 +812,7 @@ func (c *clusterClient) doretry(
 }
 
 func (c *clusterClient) BuildCrossSlotMGETs(ctx context.Context, keys []string) ([]Completed, error) {
-	if c.opt.EnableCrossSlotMGET == false {
+	if !c.opt.EnableCrossSlotMGET {
 		return nil, errors.New("cross slot MGET is not enabled")
 	}
 

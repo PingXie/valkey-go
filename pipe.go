@@ -201,7 +201,13 @@ func _newPipe(ctx context.Context, connFn func(context.Context) (net.Conn, error
 		addClientSetInfoCmds = false
 	}
 
-	init = append(init, []string{"CLIENT", "CAPA", "G:MGET:[CROSS-SLOT,UNSTABLE-SLOT]"})
+	if option.EnableCrossSlotMGET {
+		if option.AllowUnstableSlotsForCrossSlotMGET {
+			init = append(init, []string{"CLIENT", "CAPA", "G:MGET:[CROSS-SLOT,UNSTABLE-SLOT]"})
+		} else {
+			init = append(init, []string{"CLIENT", "CAPA", "G:MGET:[CROSS-SLOT]"})
+		}
+	}
 
 	timeout := option.Dialer.Timeout
 	if timeout <= 0 {

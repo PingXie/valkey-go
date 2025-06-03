@@ -6,446 +6,422 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
-	"sort" // For sorting generated keys if desired for logging consistency
-	"strings"
+	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/valkey-io/valkey-go"
 )
 
+// --- Constants ---
 const (
-	keyPrefix        = "csmget_test" // Prefix for generated keys
-	valueLength      = 10            // Length of random string values
-	NilValueString   = "(nil)"       // Representation for nil values from MGET
-	ErrorValueString = "<error_val>" // Representation for values that couldn't be parsed/fetched
+	keyPrefix        = "csmget_bench"
+	valueLength      = 10
+	NilValueString   = "(nil)"
+	ErrorValueString = "<error_val>"
 )
 
-// randString generates a random string of a given length.
-func randString(n int) string {
+// --- Custom Enum Flag Type ---
+
+type modeFlag string
+
+const (
+	modeDoMulti  modeFlag = "DoMulti"
+	modeParallel modeFlag = "Parallel"
+	modeMGet     modeFlag = "MGet"
+)
+
+func (m *modeFlag) String() string { return string(*m) }
+
+func (m *modeFlag) Set(value string) error {
+	switch value {
+	case string(modeDoMulti), string(modeParallel), string(modeMGet):
+		*m = modeFlag(value)
+		return nil
+	default:
+		return fmt.Errorf("invalid mode %q, must be one of 'DoMulti', 'MGet', or 'parallel'", value)
+	}
+}
+
+// --- Latency Measurement ---
+
+type LatencyHistogram struct {
+	mu        sync.Mutex
+	latencies []time.Duration
+	name      string
+}
+
+func NewLatencyHistogram(name string) *LatencyHistogram {
+	return &LatencyHistogram{name: name, latencies: make([]time.Duration, 0)}
+}
+
+func (h *LatencyHistogram) Add(d time.Duration) {
+	h.mu.Lock()
+	h.latencies = append(h.latencies, d)
+	h.mu.Unlock()
+}
+
+func (h *LatencyHistogram) Print() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	fmt.Printf("\n--- Latency Report for '%s' ---\n", h.name)
+	if len(h.latencies) == 0 {
+		fmt.Println("No data collected.")
+		return
+	}
+	sort.Slice(h.latencies, func(i, j int) bool { return h.latencies[i] < h.latencies[j] })
+	count := len(h.latencies)
+	var total time.Duration
+	for _, d := range h.latencies {
+		total += d
+	}
+	fmt.Printf("Total Requests: %d\n", count)
+	if count > 0 {
+		avg := total / time.Duration(count)
+		p50 := h.latencies[int(float64(count-1)*0.50)]
+		p90 := h.latencies[int(float64(count-1)*0.90)]
+		p95 := h.latencies[int(float64(count-1)*0.95)]
+		p99 := h.latencies[int(float64(count-1)*0.99)]
+		max := h.latencies[count-1]
+		fmt.Printf("  Avg: %v\n", avg.Round(time.Microsecond))
+		fmt.Printf("  P50: %v\n", p50.Round(time.Microsecond))
+		fmt.Printf("  P90: %v\n", p90.Round(time.Microsecond))
+		fmt.Printf("  P95: %v\n", p95.Round(time.Microsecond))
+		fmt.Printf("  P99: %v\n", p99.Round(time.Microsecond))
+		fmt.Printf("  Max: %v\n", max.Round(time.Microsecond))
+	}
+}
+
+// --- Data Preparation & Test Logic ---
+
+type config struct {
+	host        string
+	port        string
+	durationSec int
+	numKeys     int
+	prepKeys    int
+	threads     int
+	verbose     bool
+	mode        modeFlag
+	validate    bool
+}
+
+func randString(n int, seededRand *rand.Rand) string {
 	const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	b := make([]byte, n)
-	seededRand := rand.New(rand.NewSource(time.Now().UnixNano())) // Ensure fresh rand source if called rapidly
 	for i := range b {
 		b[i] = letterBytes[seededRand.Intn(len(letterBytes))]
 	}
 	return string(b)
 }
 
-// generateData creates a map of random keys and values, and a slice of all keys.
-func generateData(numKeys int, cycleNum int) (expectedKVs map[string]string, allKeys []string) {
-	expectedKVs = make(map[string]string, numKeys)
-	allKeys = make([]string, 0, numKeys)
-	// Using a more unique component for keys across different runs/cycles if needed
-	uniqueComponent := time.Now().UnixNano()
-
-	for i := range numKeys {
-		key := fmt.Sprintf("%s_c%d_u%d_k%d", keyPrefix, cycleNum, uniqueComponent, i)
-		value := randString(valueLength)
-		expectedKVs[key] = value
-		allKeys = append(allKeys, key)
+func prepareData(ctx context.Context, client valkey.Client, numKeys int) (map[string]string, error) {
+	fmt.Printf("INFO: Preparing %d keys...\n", numKeys)
+	preparedKVs := make(map[string]string, numKeys)
+	cmds := make(valkey.Commands, 0, numKeys)
+	seededRand := rand.New(rand.NewSource(time.Now().UnixNano()))
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("%s:%d", keyPrefix, i)
+		value := randString(valueLength, seededRand)
+		preparedKVs[key] = value
+		cmds = append(cmds, client.B().Set().Key(key).Value(value).Build())
 	}
-	// Sorting keys can make logs slightly easier to follow, though not strictly necessary.
-	sort.Strings(allKeys)
-	return expectedKVs, allKeys
+	responses := client.DoMulti(ctx, cmds...)
+	for _, resp := range responses {
+		if err := resp.Error(); err != nil {
+			fmt.Fprintf(os.Stderr, "WARN: Failed to SET a key during preparation: %v\n", err)
+		}
+	}
+	fmt.Printf("INFO: Preparation complete. %d keys populated.\n", len(preparedKVs))
+	return preparedKVs, nil
 }
 
-// setData SETs the given key-value pairs into Valkey.
-func setData(verbose bool, ctx context.Context, client valkey.Client, kvs map[string]string, cycleNum int) {
-	if verbose == true {
-		fmt.Printf("[%d] Setting %d keys...\n", cycleNum, len(kvs))
+func runSingleCycle(ctx context.Context, client valkey.Client, csClient valkey.CrossSlotClient, allPreparedKeys []string, preparedData map[string]string, cfg *config, metrics *LatencyHistogram, workerID int, cycleNum int64) {
+	keysForThisCycle := make([]string, cfg.numKeys)
+	for i := 0; i < cfg.numKeys; i++ {
+		keysForThisCycle[i] = allPreparedKeys[rand.Intn(len(allPreparedKeys))]
 	}
-	for k, v := range kvs {
-		cmd := client.B().Set().Key(k).Value(v).Build()
-		err := client.Do(ctx, cmd).Error()
+
+	var actualFetchedData map[string]string
+	start := time.Now()
+
+	switch cfg.mode {
+	case modeDoMulti, modeParallel:
+		mgetCmds, err := csClient.BuildCrossSlotMGETs(ctx, keysForThisCycle)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[%d] Error SETTING key '%s' to value '%s': %v\n", cycleNum, k, v, err)
-			// Continue trying to set other keys
+			fmt.Fprintf(os.Stderr, "[W:%d C:%d] CRITICAL: Error building MGET commands: %v\n", workerID, cycleNum, err)
+			return
 		}
-	}
-	if verbose == true {
-		fmt.Printf("[%d] Finished setting keys.\n", cycleNum)
-	}
-}
-
-// mgetJobResult holds the outcome of a single MGET command (which might fetch multiple keys).
-type mgetJobResult struct {
-	requestedKeys []string // Keys requested by this specific MGET command call
-	fetchedValues []string // Values fetched, in the same order as requestedKeys.
-	jobError      error    // Error for the whole MGET job (e.g., execution failure)
-}
-
-// executeAndCollectMGETsWithDoMulti re-implements the original logic using client.DoMulti.
-// It pipelines all MGET commands and processes the results sequentially.
-func executeAndCollectMGETsWithDoMulti(verbose bool, ctx context.Context, client valkey.Client, mgetCmds []valkey.Completed, cycleNum int) map[string]string {
-	if verbose == true {
-		fmt.Printf("[%d] Executing %d MGET command(s) with DoMulti...\n", cycleNum, len(mgetCmds))
-	}
-	actualFetchedData := make(map[string]string) // Stores key -> fetched_value_string
-
-	if len(mgetCmds) == 0 {
-		fmt.Printf("[%d] No MGET commands to execute.\n", cycleNum)
-		return actualFetchedData
-	}
-
-	// We must not access mgetCmds after it has been passed to the client.
-	allRequestedKeys := make([][]string, len(mgetCmds))
-	for i, cmd := range mgetCmds {
-		cmdArgs := cmd.Commands()
-		// A valid MGET needs at least ["MGET", "key1"].
-		if len(cmdArgs) < 2 {
-			allRequestedKeys[i] = []string{} // Store empty slice for malformed commands
-			fmt.Fprintf(os.Stderr, "[%d] Warning: MGET command #%d is malformed or has no keys. Command: %v\n", cycleNum, i, cmdArgs)
+		if cfg.mode == modeDoMulti {
+			actualFetchedData = executeAndCollectWithDoMulti(cfg.verbose, ctx, client, mgetCmds, workerID, cycleNum)
 		} else {
-			// 1. Create a new slice with its own backing array.
-			sourceKeys := cmdArgs[1:]
-			copiedKeys := make([]string, len(sourceKeys))
-			// 2. Copy the elements from the source to the new destination.
-			copy(copiedKeys, sourceKeys)
-			// 3. Store the new, safe slice.
-			allRequestedKeys[i] = copiedKeys
+			actualFetchedData = executeAndCollectWithParallel(cfg.verbose, ctx, client, mgetCmds, workerID, cycleNum)
 		}
+	case modeMGet:
+		actualFetchedData = executeAndCollectWithMGet(cfg.verbose, ctx, client,  keysForThisCycle, workerID, cycleNum)
 	}
 
-	// client.DoMulti sends all commands in a single request and returns a slice of results.
-	// The variadic '...' operator unpacks the mgetCmds slice into arguments for the function.
-	results := client.DoMulti(ctx, mgetCmds...)
+	latency := time.Since(start)
+	metrics.Add(latency)
 
-	if verbose == true {
-		fmt.Printf("[%d] Collecting and aggregating DoMulti results...\n", cycleNum)
+	if cfg.validate {
+		expectedKVsForCycle := make(map[string]string, len(keysForThisCycle))
+		for _, key := range keysForThisCycle {
+			expectedKVsForCycle[key] = preparedData[key]
+		}
+		verifyData(cfg.verbose, expectedKVsForCycle, actualFetchedData, workerID, cycleNum)
 	}
-	// The results slice directly corresponds to the mgetCmds slice.
-	for i, mgetResp := range results {
-		requestedKeys := allRequestedKeys[i]
+}
 
-		// 1. Check for a command-level error (e.g., network issue, OOM on server)
-		if err := mgetResp.Error(); err != nil {
-			fmt.Fprintf(os.Stderr, "[%d] MGET command #%d failed: %v. Keys: %v\n", cycleNum, i, err, requestedKeys)
-			for _, key := range requestedKeys {
-				actualFetchedData[key] = ErrorValueString
-			}
-			continue // Move to the next result
-		}
+// --- Main Program ---
 
-		// 2. The command executed, now parse the response which should be an array of values.
-		rawValues, arrErr := mgetResp.ToArray() // []valkey.ValkeyMessage
-		if arrErr != nil {
-			fmt.Fprintf(os.Stderr, "[%d] MGET command #%d: failed to parse response array: %v. Keys: %v\n", cycleNum, i, arrErr, requestedKeys)
-			for _, key := range requestedKeys {
-				actualFetchedData[key] = ErrorValueString
-			}
-			continue
-		}
+func main() {
+	cfg := &config{}
+	flag.StringVar(&cfg.host, "host", "127.0.0.1", "Valkey server host")
+	flag.StringVar(&cfg.port, "port", "6379", "Valkey server port")
+	flag.IntVar(&cfg.durationSec, "duration", 10, "Test duration in seconds")
+	flag.IntVar(&cfg.numKeys, "numkeys", 100, "Number of keys to MGET per cycle")
+	flag.IntVar(&cfg.prepKeys, "prepkeys", 10000, "Number of keys to pre-populate")
+	flag.IntVar(&cfg.threads, "threads", 4, "Number of concurrent threads to run test cycles")
+	flag.BoolVar(&cfg.verbose, "verbose", false, "Enable verbose output")
+	flag.BoolVar(&cfg.validate, "validate", true, "Perform data validation on each cycle")
+	cfg.mode = modeDoMulti
+	flag.Var(&cfg.mode, "mode", "Execution mode: 'DoMulti', 'MGet', or 'Parallel'")
+	flag.Parse()
 
-		// 3. Verify that the number of results matches the number of keys requested.
-		if len(rawValues) != len(requestedKeys) {
-			fmt.Fprintf(os.Stderr, "[%d] MGET command #%d: result count mismatch. Expected %d, got %d. Keys: %v\n",
-				cycleNum, i, len(requestedKeys), len(rawValues), requestedKeys)
-			for _, key := range requestedKeys {
-				actualFetchedData[key] = ErrorValueString
-			}
-			continue
-		}
+	serverAddr := fmt.Sprintf("%s:%s", cfg.host, cfg.port)
+	fmt.Printf("INFO: Connecting to Valkey server at: %s\n", serverAddr)
+	client, err := valkey.NewClient(valkey.ClientOption{InitAddress: []string{serverAddr}, EnableCrossSlotMGET: true, AllowUnstableSlotsForCrossSlotMGET: true})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: Failed to create Valkey client: %v\n", err)
+		os.Exit(1)
+	}
+	defer client.Close()
+	csClient, ok := client.(valkey.CrossSlotClient)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "FATAL: The client does not implement valkey.CrossSlotClient\n")
+		os.Exit(1)
+	}
+	fmt.Println("INFO: Valkey client connected successfully.")
 
-		// 4. Process each key-value pair from the successful MGET command.
-		for j, itemMsg := range rawValues {
-			currentKey := requestedKeys[j]
-			if itemMsg.IsNil() {
-				actualFetchedData[currentKey] = NilValueString
-			} else {
-				valStr, strErr := itemMsg.ToString()
-				if strErr != nil {
-					fmt.Fprintf(os.Stderr, "[%d] Cmd #%d: Error converting result for key '%s': %v\n",
-						cycleNum, i, currentKey, strErr)
-					actualFetchedData[currentKey] = ErrorValueString
-				} else {
-					actualFetchedData[currentKey] = valStr
+	preparedData, err := prepareData(context.Background(), client, cfg.prepKeys)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: Failed during data preparation: %v\n", err)
+		os.Exit(1)
+	}
+	allPreparedKeys := make([]string, 0, len(preparedData))
+	for k := range preparedData {
+		allPreparedKeys = append(allPreparedKeys, k)
+	}
+
+	metrics := NewLatencyHistogram(string(cfg.mode))
+	mainLoopCtx, cancelMainLoop := context.WithTimeout(context.Background(), time.Duration(cfg.durationSec)*time.Second)
+	defer cancelMainLoop()
+
+	var wg sync.WaitGroup
+	var totalCycles atomic.Int64
+	fmt.Printf("\nINFO: Starting test run with mode '%s' on %d thread(s) for %d seconds...\n", cfg.mode, cfg.threads, cfg.durationSec)
+
+	for i := 0; i < cfg.threads; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+		loop:
+			for {
+				select {
+				case <-mainLoopCtx.Done():
+					break loop
+				default:
+					cycleNum := totalCycles.Add(1)
+					runSingleCycle(context.Background(), client, csClient, allPreparedKeys, preparedData, cfg, metrics, workerID, cycleNum)
 				}
 			}
-		}
+		}(i + 1)
+	}
+	wg.Wait()
+	fmt.Printf("\nINFO: Test finished. Completed %v total cycles across %d thread(s).\n", totalCycles.Load(), cfg.threads)
+	metrics.Print()
+}
+
+// --- MGET Execution and Verification Functions ---
+
+// executeAndCollectWithMGet is the wrapper for the 'MGet' mode.
+func executeAndCollectWithMGet(verbose bool, ctx context.Context, client valkey.Client, keys []string, workerID int, cycleNum int64) map[string]string {
+	if verbose {
+		fmt.Printf("[W:%d C:%d] Executing with MGet helper for %d keys...\n", workerID, cycleNum, len(keys))
+	}
+	actualFetchedData := make(map[string]string, len(keys))
+	results, err := valkey.MGet(client, ctx, keys)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[W:%d C:%d] MGet helper returned an error: %v\n", workerID, cycleNum, err)
 	}
 
-	if verbose == true {
-		fmt.Printf("[%d] Finished collecting DoMulti results. Total unique keys in fetched map: %d\n", cycleNum, len(actualFetchedData))
+	for key, msg := range results {
+		if msg.IsNil() {
+			actualFetchedData[key] = NilValueString
+		} else if valStr, strErr := msg.ToString(); strErr != nil {
+			actualFetchedData[key] = ErrorValueString
+		} else {
+			actualFetchedData[key] = valStr
+		}
+	}
+	// Ensure all requested keys are accounted for, even if they were missing from the results map
+	for _, key := range keys {
+		if _, ok := actualFetchedData[key]; !ok {
+			actualFetchedData[key] = ErrorValueString
+		}
 	}
 	return actualFetchedData
 }
 
-// executeAndCollectMGETs executes a list of MGET commands in parallel and aggregates their results.
-func executeAndCollectMGETs(verbose bool, ctx context.Context, client valkey.Client, mgetCmds []valkey.Completed, cycleNum int) map[string]string {
-	if verbose == true {
-		fmt.Printf("[%d] Executing %d MGET command(s) in parallel...\n", cycleNum, len(mgetCmds))
-	}
-	actualFetchedData := make(map[string]string) // Stores key -> fetched_value_string
+// mgetJobResult holds the outcome of a single MGET command in the Parallel Do model.
+type mgetJobResult struct {
+	requestedKeys []string
+	fetchedValues []string
+	jobError      error
+}
 
+func executeAndCollectWithDoMulti(verbose bool, ctx context.Context, client valkey.Client, mgetCmds []valkey.Completed, workerID int, cycleNum int64) map[string]string {
+	// Renamed function, body is identical to previous executeAndCollectMGETsWithDoMulti
+	if verbose {
+		fmt.Printf("[W:%d C:%d] Executing %d MGET command(s) with DoMulti...\n", workerID, cycleNum, len(mgetCmds))
+	}
+	actualFetchedData := make(map[string]string)
 	if len(mgetCmds) == 0 {
-		fmt.Printf("[%d] No MGET commands to execute.\n", cycleNum)
 		return actualFetchedData
 	}
+	allRequestedKeys := make([][]string, len(mgetCmds))
+	for i, cmd := range mgetCmds {
+		cmdArgs := cmd.Commands()
+		if len(cmdArgs) < 2 {
+			allRequestedKeys[i] = []string{}
+		} else {
+			sourceKeys := cmdArgs[1:]
+			copiedKeys := make([]string, len(sourceKeys))
+			copy(copiedKeys, sourceKeys)
+			allRequestedKeys[i] = copiedKeys
+		}
+	}
+	results := client.DoMulti(ctx, mgetCmds...)
+	for i, mgetResp := range results {
+		requestedKeys := allRequestedKeys[i]
+		if err := mgetResp.Error(); err != nil {
+			fmt.Fprintf(os.Stderr, "[W:%d C:%d] DoMulti command #%d failed: %v. Keys: %v\n", workerID, cycleNum, i, err, requestedKeys)
+			for _, key := range requestedKeys {
+				actualFetchedData[key] = ErrorValueString
+			}
+			continue
+		}
+		rawValues, arrErr := mgetResp.ToArray()
+		if arrErr != nil || len(rawValues) != len(requestedKeys) {
+			fmt.Fprintf(os.Stderr, "[W:%d C:%d] DoMulti command #%d parse/count mismatch. Err: %v\n", workerID, cycleNum, i, arrErr)
+			for _, key := range requestedKeys {
+				actualFetchedData[key] = ErrorValueString
+			}
+			continue
+		}
+		for j, itemMsg := range rawValues {
+			currentKey := requestedKeys[j]
+			if itemMsg.IsNil() {
+				actualFetchedData[currentKey] = NilValueString
+			} else if valStr, strErr := itemMsg.ToString(); strErr != nil {
+				actualFetchedData[currentKey] = ErrorValueString
+			} else {
+				actualFetchedData[currentKey] = valStr
+			}
+		}
+	}
+	return actualFetchedData
+}
 
+func executeAndCollectWithParallel(verbose bool, ctx context.Context, client valkey.Client, mgetCmds []valkey.Completed, workerID int, cycleNum int64) map[string]string {
+	// Renamed function, body is identical to previous executeAndCollectMGETs
+	if verbose {
+		fmt.Printf("[W:%d C:%d] Executing %d MGET command(s) in Parallel...\n", workerID, cycleNum, len(mgetCmds))
+	}
+	actualFetchedData := make(map[string]string)
+	if len(mgetCmds) == 0 {
+		return actualFetchedData
+	}
 	resultsChan := make(chan mgetJobResult, len(mgetCmds))
 	var wg sync.WaitGroup
-
 	for i, mgetCmd := range mgetCmds {
 		wg.Add(1)
 		go func(cmd valkey.Completed, cmdIndex int) {
 			defer wg.Done()
 			jobRes := mgetJobResult{}
-
-			cmdArgs := cmd.Commands()                                      // Expected: ["MGET", "keyA", "keyB", ...]
-			if len(cmdArgs) < 1 || strings.ToUpper(cmdArgs[0]) != "MGET" { // MGET itself needs at least one key argument to be valid
-				jobRes.jobError = fmt.Errorf("command %d: invalid MGET command structure from BuildCrossSlotMGETs: %v", cmdIndex, cmdArgs)
+			cmdArgs := cmd.Commands()
+			if len(cmdArgs) < 2 {
+				jobRes.jobError = fmt.Errorf("command %d: invalid MGET structure: %v", cmdIndex, cmdArgs)
 				resultsChan <- jobRes
 				return
 			}
-			if len(cmdArgs) == 1 { // Just "MGET" with no keys
-				// This is technically a valid command but will result in an error from the server.
-				// Let client.Do handle it, or could catch it here. For now, let it pass to Do.
-				jobRes.requestedKeys = []string{}
-			} else {
-				originalSlice := cmdArgs[1:]
-				jobRes.requestedKeys = make([]string, len(originalSlice))
-				copy(jobRes.requestedKeys, originalSlice)
-			}
+			originalSlice := cmdArgs[1:]
+			jobRes.requestedKeys = make([]string, len(originalSlice))
+			copy(jobRes.requestedKeys, originalSlice)
 			jobRes.fetchedValues = make([]string, len(jobRes.requestedKeys))
-
-			// fmt.Printf("[%d] Goroutine %d: Executing MGET for keys: %v\n", cycleNum, cmdIndex, jobRes.requestedKeys)
-			mgetResp := client.Do(ctx, cmd) // client is valkey.Client
-
+			mgetResp := client.Do(ctx, cmd)
 			if err := mgetResp.Error(); err != nil {
-				jobRes.jobError = fmt.Errorf("command %d (keys %v): MGET execution failed: %w", cmdIndex, jobRes.requestedKeys, err)
+				jobRes.jobError = fmt.Errorf("command %d (keys %v): exec failed: %w", cmdIndex, jobRes.requestedKeys, err)
 				resultsChan <- jobRes
 				return
 			}
-
-			rawValues, arrErr := mgetResp.ToArray() // []valkey.ValkeyMessage
-			if arrErr != nil {
-				jobRes.jobError = fmt.Errorf("command %d (keys %v): MGET ToArray() failed: %w. Raw response: %s", cmdIndex, jobRes.requestedKeys, arrErr, mgetResp.String())
+			rawValues, arrErr := mgetResp.ToArray()
+			if arrErr != nil || len(rawValues) != len(jobRes.requestedKeys) {
+				jobRes.jobError = fmt.Errorf("command %d (keys %v): parse/count mismatch. Err: %w", cmdIndex, jobRes.requestedKeys, arrErr)
 				resultsChan <- jobRes
 				return
 			}
-
-			if len(rawValues) != len(jobRes.requestedKeys) {
-				jobRes.jobError = fmt.Errorf("command %d (keys %v): MGET result count mismatch: expected %d, got %d. Raw response: %s",
-					cmdIndex, jobRes.requestedKeys, len(jobRes.requestedKeys), len(rawValues), mgetResp.String())
-				resultsChan <- jobRes
-				return
-			}
-
 			for i, itemMsg := range rawValues {
-				currentKey := jobRes.requestedKeys[i]
 				if itemMsg.IsNil() {
 					jobRes.fetchedValues[i] = NilValueString
+				} else if valStr, strErr := itemMsg.ToString(); strErr != nil {
+					jobRes.fetchedValues[i] = ErrorValueString
 				} else {
-					valStr, strErr := itemMsg.ToString()
-					if strErr != nil {
-						fmt.Fprintf(os.Stderr, "[%d] Cmd %d: Error converting MGET result for key '%s' (part of MGET for %v): %v\n",
-							cycleNum, cmdIndex, currentKey, jobRes.requestedKeys, strErr)
-						jobRes.fetchedValues[i] = ErrorValueString // Mark this specific value as errored
-					} else {
-						jobRes.fetchedValues[i] = valStr
-					}
+					jobRes.fetchedValues[i] = valStr
 				}
 			}
 			resultsChan <- jobRes
 		}(mgetCmd, i)
 	}
-
 	wg.Wait()
 	close(resultsChan)
-
-	if verbose == true {
-		fmt.Printf("[%d] Collecting and aggregating MGET results...\n", cycleNum)
-	}
 	for jobRes := range resultsChan {
 		if jobRes.jobError != nil {
-			fmt.Fprintf(os.Stderr, "[%d] MGET job processing error: %v\n", cycleNum, jobRes.jobError)
-			// Mark all keys requested by this failed job as having errored in retrieval
+			fmt.Fprintf(os.Stderr, "[W:%d C:%d] Parallel job processing error: %v\n", workerID, cycleNum, jobRes.jobError)
 			for _, key := range jobRes.requestedKeys {
 				actualFetchedData[key] = ErrorValueString
 			}
-			continue // Skip to the next job result
+			continue
 		}
-
 		for i, key := range jobRes.requestedKeys {
-			// Ensure index is within bounds, though previous checks should guarantee it.
-			if i < len(jobRes.fetchedValues) {
-				actualFetchedData[key] = jobRes.fetchedValues[i]
-			} else {
-				fmt.Fprintf(os.Stderr, "[%d] Warning: MGET results slice shorter than requested keys for key '%s'. Marking as error.\n", cycleNum, key)
-				actualFetchedData[key] = ErrorValueString
-			}
+			actualFetchedData[key] = jobRes.fetchedValues[i]
 		}
-	}
-	if verbose == true {
-		fmt.Printf("[%d] Finished collecting MGET results. Total unique keys in fetched map: %d\n", cycleNum, len(actualFetchedData))
 	}
 	return actualFetchedData
 }
 
-// verifyData compares expected key-value pairs with actual fetched data.
-func verifyData(verbose bool, expectedKVs, actualKVs map[string]string, cycleNum int) {
-	if verbose == true {
-		fmt.Printf("[%d] Verifying %d expected keys...\n", cycleNum, len(expectedKVs))
+func verifyData(verbose bool, expectedKVs, actualKVs map[string]string, workerID int, cycleNum int64) {
+	if verbose {
+		fmt.Printf("[W:%d C:%d] Verifying %d keys...\n", workerID, cycleNum, len(expectedKVs))
 	}
 	mismatches := 0
-	missingInActual := 0      // Keys expected but not found in MGET results at all
-	nilInsteadOfValue := 0    // Keys expected with a value but MGET returned (nil)
-	errorRetrievingValue := 0 // Keys for which MGET returned an error string
-
 	for expectedKey, expectedValue := range expectedKVs {
 		actualValue, found := actualKVs[expectedKey]
 		if !found {
-			fmt.Fprintf(os.Stderr, "[%d] VERIFY FAIL: Key '%s' was SET (expected value '%s') but NOT FOUND in MGET results.\n", cycleNum, expectedKey, expectedValue)
-			missingInActual++
-			continue
-		}
-		if actualValue == NilValueString {
-			fmt.Fprintf(os.Stderr, "[%d] VERIFY FAIL: Key '%s' expected value '%s', but MGET returned '%s'.\n", cycleNum, expectedKey, expectedValue, NilValueString)
-			nilInsteadOfValue++
-			// This is a form of mismatch if a non-nil value was expected.
+			fmt.Fprintf(os.Stderr, "[W:%d C:%d] VERIFY FAIL: Key '%s' was expected but NOT FOUND.\n", workerID, cycleNum, expectedKey)
 			mismatches++
-			continue
-		}
-		if actualValue == ErrorValueString {
-			fmt.Fprintf(os.Stderr, "[%d] VERIFY INFO: Key '%s' (expected value '%s') could not be properly verified due to an earlier MGET error ('%s').\n", cycleNum, expectedKey, expectedValue, ErrorValueString)
-			errorRetrievingValue++
-			// Not a data mismatch per se, but a retrieval failure.
 			continue
 		}
 		if actualValue != expectedValue {
-			fmt.Fprintf(os.Stderr, "[%d] VERIFY FAIL: Key '%s' DATA MISMATCH. Expected: '%s', Got: '%s'\n", cycleNum, expectedKey, expectedValue, actualValue)
+			fmt.Fprintf(os.Stderr, "[W:%d C:%d] VERIFY FAIL: Key '%s' DATA MISMATCH. Expected: '%s', Got: '%s'\n", workerID, cycleNum, expectedKey, expectedValue, actualValue)
 			mismatches++
 		}
 	}
-
-	extraInActual := 0
-	for actualKey := range actualKVs {
-		if _, expected := expectedKVs[actualKey]; !expected {
-			// This should ideally not happen if MGETs are only for keys we set.
-			fmt.Fprintf(os.Stderr, "[%d] VERIFY WARN: Key '%s' (value '%s') was fetched by MGET but was NOT in the expected set for this cycle.\n", cycleNum, actualKey, actualKVs[actualKey])
-			extraInActual++
-		}
+	if mismatches > 0 {
+		fmt.Fprintf(os.Stderr, "[W:%d C:%d] VERIFY SUMMARY: Found %d mismatches/errors.\n", workerID, cycleNum, mismatches)
+	} else if verbose {
+		fmt.Printf("[W:%d C:%d] VERIFY PASS: All %d keys matched.\n", workerID, cycleNum, len(expectedKVs))
 	}
-
-	if mismatches == 0 && missingInActual == 0 && nilInsteadOfValue == 0 && errorRetrievingValue == 0 && extraInActual == 0 {
-		if verbose == true {
-			fmt.Printf("[%d] VERIFY PASS: All %d keys and values matched successfully.\n", cycleNum, len(expectedKVs))
-		}
-	} else {
-		fmt.Printf("[%d] VERIFY SUMMARY (out of %d expected keys):\n"+
-			"  - Data Mismatches (value different or was nil when value expected): %d\n"+
-			"  - Keys Missing in MGET results: %d\n"+
-			"  - Keys With Error during MGET retrieval/parsing: %d\n"+
-			"  - Unexpected Extra Keys in MGET results: %d\n",
-			cycleNum, len(expectedKVs), mismatches, missingInActual, errorRetrievingValue, extraInActual)
-		os.Exit(1) // Exit with error code if any mismatches or issues found
-	}
-}
-
-// runSingleCycle performs one iteration of data generation, SET, MGET, and Verify.
-func runSingleCycle(baseCtx context.Context, domulti bool, verbose bool, client valkey.Client, crossSlotClient valkey.CrossSlotClient, numKeys int, cycleNum int) {
-	if verbose == true {
-		fmt.Printf("\n[%d] === Starting Test Cycle ===\n", cycleNum)
-	}
-	// Create a context for this cycle's operations, can be Background or derived.
-	cycleCtx := baseCtx // For now, use the passed context (which might be Background)
-
-	// 1. Generate Data
-	expectedKVs, allKeys := generateData(numKeys, cycleNum)
-	if verbose == true {
-		fmt.Printf("[%d] Generated %d key-value pairs.\n", cycleNum, len(expectedKVs))
-	}
-
-	// 2. SET Data
-	setData(verbose, cycleCtx, client, expectedKVs, cycleNum)
-
-	// 3. Build MGET Commands
-	if verbose == true {
-		fmt.Printf("[%d] Building cross-slot MGET commands for %d keys.\n", cycleNum, len(allKeys))
-	}
-	// For debugging: fmt.Printf("[%d] Keys for MGET: %v\n", cycleNum, allKeys)
-	mgetCmds, err := crossSlotClient.BuildCrossSlotMGETs(cycleCtx, allKeys)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[%d] CRITICAL: Error building MGET commands: %v. Skipping MGET and Verify for this cycle.\n", cycleNum, err)
-		return
-	}
-	if verbose == true {
-		fmt.Printf("[%d] Built %d MGET command(s) to fetch the keys.\n", cycleNum, len(mgetCmds))
-	}
-	// For verbose debugging of generated MGET commands:
-	// for i, cmd := range mgetCmds {
-	// 	fmt.Printf("[%d]   MGET Cmd %d targets keys: %v\n", cycleNum, i, cmd.Commands()[1:])
-	// }
-
-	// 4. Execute MGETs in parallel and collect results
-	var actualFetchedData map[string]string
-	if domulti {
-		actualFetchedData = executeAndCollectMGETsWithDoMulti(verbose, cycleCtx, client, mgetCmds, cycleNum)
-	} else {
-		actualFetchedData = executeAndCollectMGETs(verbose, cycleCtx, client, mgetCmds, cycleNum)
-	}
-
-	// 5. Verify Data
-	verifyData(verbose, expectedKVs, actualFetchedData, cycleNum)
-	if verbose == true {
-		fmt.Printf("[%d] === Finished Test Cycle ===\n", cycleNum)
-	}
-}
-
-func main() {
-	host := flag.String("host", "127.0.0.1", "Valkey server host IP/hostname")
-	port := flag.String("port", "6379", "Valkey server port")
-	durationSec := flag.Int("duration", 10, "Test duration in seconds")
-	numKeys := flag.Int("numkeys", 10, "Number of keys to MGET per cycle")
-	verbose := flag.Bool("verbose", false, "Enable verbose output (for debugging purposes)")
-	domulti := flag.Bool("domulti", true, "Use client.DoMulti for MGETs (default true); set to false to use parallel goroutines with client.Do")
-	flag.Parse()
-
-	serverAddr := fmt.Sprintf("%s:%s", *host, *port)
-	fmt.Printf("Attempting to connect to Valkey server at: %s\n", serverAddr)
-
-	client, err := valkey.NewClient(valkey.ClientOption{
-		InitAddress:                        []string{serverAddr},
-		EnableCrossSlotMGET:                true,
-		AllowUnstableSlotsForCrossSlotMGET: true,
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create Valkey client: %v\n", err)
-		os.Exit(1)
-	}
-	defer client.Close()
-	fmt.Println("Valkey client created successfully.")
-
-	crossSlotCapableClient, ok := client.(valkey.CrossSlotClient)
-	if !ok {
-		fmt.Fprintf(os.Stderr, "FATAL: The connected Valkey client (type %T) does not implement the valkey.CrossSlotClient interface required for BuildCrossSlotMGETs. Ensure you are using a compatible client (e.g., a cluster client if appropriate).\n", client)
-		os.Exit(1)
-	}
-	fmt.Println("Client successfully asserted to valkey.CrossSlotClient interface.")
-
-	// Main loop controlled by duration
-	mainLoopCtx, cancelMainLoop := context.WithTimeout(context.Background(), time.Duration(*durationSec)*time.Second)
-	defer cancelMainLoop()
-
-	cycleNum := 0
-	fmt.Printf("\nStarting test run for %d seconds, with %d keys per cycle.\n", *durationSec, *numKeys)
-
-loop:
-	for {
-		select {
-		case <-mainLoopCtx.Done():
-			fmt.Println("\nTest duration elapsed. Exiting main loop.")
-			break loop
-		default:
-			cycleNum++
-			// Each cycle gets a fresh background context for its operations.
-			// If needed, child contexts with deadlines could be derived from mainLoopCtx.
-			runSingleCycle(context.Background(), *domulti, *verbose, client, crossSlotCapableClient, *numKeys, cycleNum)
-			// Optional: Add a small delay between cycles if you don't want them back-to-back.
-			// time.Sleep(100 * time.Millisecond)
-		}
-	}
-
-	fmt.Printf("\nCompleted %v cycles of MGET operations; domulti %v.\n", cycleNum, *domulti)
 }

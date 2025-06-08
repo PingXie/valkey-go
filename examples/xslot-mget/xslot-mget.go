@@ -242,8 +242,8 @@ func main() {
 
 	var wg sync.WaitGroup
 	var totalCycles atomic.Int64
-	fmt.Printf("\nINFO: Starting test run with mode '%s' on %d thread(s) for %d seconds...\n", cfg.mode, cfg.threads, cfg.durationSec)
-	fmt.Printf("\nINFO: Total keys prepared: %d, Value length: %d bytes, Number of Keys Per Batch: %d\n", len(allPreparedKeys), cfg.valueLength, cfg.numKeys)
+	fmt.Printf("INFO: Total keys prepared: %d, Value length: %d bytes, Number of Keys Per Batch: %d\n", len(allPreparedKeys), cfg.valueLength, cfg.numKeys)
+	fmt.Printf("INFO: Starting test run with mode '%s' on %d thread(s) for %d seconds...\n", cfg.mode, cfg.threads, cfg.durationSec)
 
 	for i := 0; i < cfg.threads; i++ {
 		wg.Add(1)

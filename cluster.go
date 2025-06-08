@@ -844,7 +844,7 @@ func (c *clusterClient) BuildCrossSlotMGETs(ctx context.Context, keys []string) 
 	commands := make([]Completed, 0, len(commandsMap))
 	for _, cmd := range commandsMap {
 		completed := cmd.Build()
-		completed.SetSlot(completed.Commands()[1])
+		completed = completed.SetSlot(completed.Commands()[1])
 		commands = append(commands, completed)
 	}
 

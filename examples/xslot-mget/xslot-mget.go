@@ -17,7 +17,6 @@ import (
 // --- Constants ---
 const (
 	keyPrefix        = "csmget_bench"
-	valueLength      = 10
 	NilValueString   = "(nil)"
 	ErrorValueString = "<error_val>"
 )
@@ -29,14 +28,14 @@ type modeFlag string
 const (
 	modeDoMulti  modeFlag = "DoMulti"
 	modeParallel modeFlag = "Parallel"
-	modeMGet     modeFlag = "MGet"
+	modeGet      modeFlag = "Get"
 )
 
 func (m *modeFlag) String() string { return string(*m) }
 
 func (m *modeFlag) Set(value string) error {
 	switch value {
-	case string(modeDoMulti), string(modeParallel), string(modeMGet):
+	case string(modeDoMulti), string(modeParallel), string(modeGet):
 		*m = modeFlag(value)
 		return nil
 	default:
@@ -101,10 +100,12 @@ type config struct {
 	durationSec int
 	numKeys     int
 	prepKeys    int
+	valueLength int
 	threads     int
 	verbose     bool
 	mode        modeFlag
 	validate    bool
+	populate   bool
 }
 
 func randString(n int, seededRand *rand.Rand) string {
@@ -116,11 +117,27 @@ func randString(n int, seededRand *rand.Rand) string {
 	return string(b)
 }
 
-func prepareData(ctx context.Context, client valkey.Client, numKeys int) (map[string]string, error) {
-	fmt.Printf("INFO: Preparing %d keys...\n", numKeys)
+func prepareKeys(numKeys int) []string {
+ 	fmt.Printf("INFO: Poreparing %d keys...\n", numKeys)
+	keys := make([]string, numKeys)
+	for i := 0; i < numKeys; i++ {
+		keys[i] = fmt.Sprintf("%s:%d", keyPrefix, i)
+	}
+	return keys
+}
+
+func prepareData(ctx context.Context, client valkey.Client, keys []string, valueLength int) (map[string]string, error) {
+	fmt.Printf("INFO: Preparing values ...\n")
+	numKeys := len(keys)
 	preparedKVs := make(map[string]string, numKeys)
 	cmds := make(valkey.Commands, 0, numKeys)
 	seededRand := rand.New(rand.NewSource(time.Now().UnixNano()))
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("%s:%d", keyPrefix, i)
+		value := randString(valueLength, seededRand)
+		preparedKVs[key] = value
+		cmds = append(cmds, client.B().Set().Key(key).Value(value).Build())
+	}
 	for i := 0; i < numKeys; i++ {
 		key := fmt.Sprintf("%s:%d", keyPrefix, i)
 		value := randString(valueLength, seededRand)
@@ -158,14 +175,14 @@ func runSingleCycle(ctx context.Context, client valkey.Client, csClient valkey.C
 		} else {
 			actualFetchedData = executeAndCollectWithParallel(cfg.verbose, ctx, client, mgetCmds, workerID, cycleNum)
 		}
-	case modeMGet:
+	case modeGet:
 		actualFetchedData = executeAndCollectWithMGet(cfg.verbose, ctx, client,  keysForThisCycle, workerID, cycleNum)
 	}
 
 	latency := time.Since(start)
 	metrics.Add(latency)
 
-	if cfg.validate {
+	if cfg.validate && preparedData != nil {
 		expectedKVsForCycle := make(map[string]string, len(keysForThisCycle))
 		for _, key := range keysForThisCycle {
 			expectedKVsForCycle[key] = preparedData[key]
@@ -183,11 +200,13 @@ func main() {
 	flag.IntVar(&cfg.durationSec, "duration", 10, "Test duration in seconds")
 	flag.IntVar(&cfg.numKeys, "numkeys", 100, "Number of keys to MGET per cycle")
 	flag.IntVar(&cfg.prepKeys, "prepkeys", 10000, "Number of keys to pre-populate")
+	flag.IntVar(&cfg.valueLength, "valueLength", 1024, "Size of each value in bytes (default: 1024)")
 	flag.IntVar(&cfg.threads, "threads", 4, "Number of concurrent threads to run test cycles")
 	flag.BoolVar(&cfg.verbose, "verbose", false, "Enable verbose output")
-	flag.BoolVar(&cfg.validate, "validate", true, "Perform data validation on each cycle")
+	flag.BoolVar(&cfg.validate, "validate", false, "Perform data validation on each cycle")
+	flag.BoolVar(&cfg.populate, "populate", false, "Populate Valkey with random data before running tests")
 	cfg.mode = modeDoMulti
-	flag.Var(&cfg.mode, "mode", "Execution mode: 'DoMulti', 'MGet', or 'Parallel'")
+	flag.Var(&cfg.mode, "mode", "Execution mode: 'DoMulti', 'Get', or 'Parallel'")
 	flag.Parse()
 
 	serverAddr := fmt.Sprintf("%s:%s", cfg.host, cfg.port)
@@ -205,14 +224,16 @@ func main() {
 	}
 	fmt.Println("INFO: Valkey client connected successfully.")
 
-	preparedData, err := prepareData(context.Background(), client, cfg.prepKeys)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "FATAL: Failed during data preparation: %v\n", err)
-		os.Exit(1)
-	}
-	allPreparedKeys := make([]string, 0, len(preparedData))
-	for k := range preparedData {
-		allPreparedKeys = append(allPreparedKeys, k)
+	allPreparedKeys := prepareKeys(cfg.prepKeys)
+
+	var preparedData map[string]string
+	if cfg.populate {
+		var err error
+		preparedData, err = prepareData(context.Background(), client, allPreparedKeys, cfg.valueLength)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "FATAL: Failed during data preparation: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	metrics := NewLatencyHistogram(string(cfg.mode))
@@ -222,6 +243,7 @@ func main() {
 	var wg sync.WaitGroup
 	var totalCycles atomic.Int64
 	fmt.Printf("\nINFO: Starting test run with mode '%s' on %d thread(s) for %d seconds...\n", cfg.mode, cfg.threads, cfg.durationSec)
+	fmt.Printf("\nINFO: Total keys prepared: %d, Value length: %d bytes, Number of Keys Per Batch: %d\n", len(allPreparedKeys), cfg.valueLength, cfg.numKeys)
 
 	for i := 0; i < cfg.threads; i++ {
 		wg.Add(1)

@@ -106,6 +106,7 @@ type config struct {
 	mode        modeFlag
 	validate    bool
 	populate   bool
+	readReplica   bool
 }
 
 func randString(n int, seededRand *rand.Rand) string {
@@ -205,13 +206,21 @@ func main() {
 	flag.BoolVar(&cfg.verbose, "verbose", false, "Enable verbose output")
 	flag.BoolVar(&cfg.validate, "validate", false, "Perform data validation on each cycle")
 	flag.BoolVar(&cfg.populate, "populate", false, "Populate Valkey with random data before running tests")
+	flag.BoolVar(&cfg.readReplica, "replica", false, "Use read replica (default: false)")
 	cfg.mode = modeDoMulti
 	flag.Var(&cfg.mode, "mode", "Execution mode: 'DoMulti', 'Get', or 'Parallel'")
 	flag.Parse()
 
 	serverAddr := fmt.Sprintf("%s:%s", cfg.host, cfg.port)
 	fmt.Printf("INFO: Connecting to Valkey server at: %s\n", serverAddr)
-	client, err := valkey.NewClient(valkey.ClientOption{InitAddress: []string{serverAddr}, EnableCrossSlotMGET: true, AllowUnstableSlotsForCrossSlotMGET: true})
+	client, err := valkey.NewClient(valkey.ClientOption{
+		InitAddress: []string{serverAddr},
+		EnableCrossSlotMGET: true,
+		AllowUnstableSlotsForCrossSlotMGET: true,
+		SendToReplicas: func(cmd valkey.Completed) bool {
+			return cfg.readReplica && cmd.IsReadOnly() && rand.Float64() < 0.5
+		},
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: Failed to create Valkey client: %v\n", err)
 		os.Exit(1)

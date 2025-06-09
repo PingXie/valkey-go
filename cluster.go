@@ -574,7 +574,8 @@ func (c *clusterClient) _pickMulti(multi []Completed) (retries *connretry, init 
 	count := conncountp.Get(len(c.conns), len(c.conns))
 
 	if !init && c.rslots != nil && c.opt.SendToReplicas != nil {
-		for _, cmd := range multi {
+		destinations := make([]conn, len(multi))
+		for i, cmd := range multi {
 			var cc conn
 			if c.opt.SendToReplicas(cmd) {
 				cc = c.rslots[cmd.Slot()]
@@ -584,6 +585,7 @@ func (c *clusterClient) _pickMulti(multi []Completed) (retries *connretry, init 
 			if cc == nil {
 				return nil, false
 			}
+			destinations[i] = cc
 			count.m[cc]++
 		}
 
@@ -594,15 +596,7 @@ func (c *clusterClient) _pickMulti(multi []Completed) (retries *connretry, init 
 		conncountp.Put(count)
 
 		for i, cmd := range multi {
-			var cc conn
-			if c.opt.SendToReplicas(cmd) {
-				cc = c.rslots[cmd.Slot()]
-			} else {
-				cc = c.pslots[cmd.Slot()]
-			}
-			if cc == nil { // check cc == nil again in the case of non-deterministic SendToReplicas.
-				return nil, false
-			}
+			cc := destinations[i]
 			re := retries.m[cc]
 			re.commands = append(re.commands, cmd)
 			re.cIndexes = append(re.cIndexes, i)

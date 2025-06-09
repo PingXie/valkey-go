@@ -26,20 +26,19 @@ const (
 type modeFlag string
 
 const (
-	modeDoMulti  modeFlag = "DoMulti"
-	modeParallel modeFlag = "Parallel"
-	modeGet      modeFlag = "Get"
+	modeMGet  modeFlag = "MGet"
+	modeGet   modeFlag = "Get"
 )
 
 func (m *modeFlag) String() string { return string(*m) }
 
 func (m *modeFlag) Set(value string) error {
 	switch value {
-	case string(modeDoMulti), string(modeParallel), string(modeGet):
+	case string(modeMGet), string(modeGet):
 		*m = modeFlag(value)
 		return nil
 	default:
-		return fmt.Errorf("invalid mode %q, must be one of 'DoMulti', 'MGet', or 'parallel'", value)
+		return fmt.Errorf("invalid mode %q, must be one of 'MGet' or 'Get'", value)
 	}
 }
 
@@ -155,7 +154,7 @@ func prepareData(ctx context.Context, client valkey.Client, keys []string, value
 	return preparedKVs, nil
 }
 
-func runSingleCycle(ctx context.Context, client valkey.Client, csClient valkey.CrossSlotClient, allPreparedKeys []string, preparedData map[string]string, cfg *config, metrics *LatencyHistogram, workerID int, cycleNum int64) {
+func runSingleCycle(ctx context.Context, client valkey.Client, allPreparedKeys []string, preparedData map[string]string, cfg *config, metrics *LatencyHistogram, workerID int, cycleNum int64) {
 	keysForThisCycle := make([]string, cfg.numKeys)
 	for i := 0; i < cfg.numKeys; i++ {
 		keysForThisCycle[i] = allPreparedKeys[rand.Intn(len(allPreparedKeys))]
@@ -165,19 +164,10 @@ func runSingleCycle(ctx context.Context, client valkey.Client, csClient valkey.C
 	start := time.Now()
 
 	switch cfg.mode {
-	case modeDoMulti, modeParallel:
-		mgetCmds, err := csClient.BuildCrossSlotMGETs(ctx, keysForThisCycle)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[W:%d C:%d] CRITICAL: Error building MGET commands: %v\n", workerID, cycleNum, err)
-			return
-		}
-		if cfg.mode == modeDoMulti {
-			actualFetchedData = executeAndCollectWithDoMulti(cfg.verbose, ctx, client, mgetCmds, workerID, cycleNum)
-		} else {
-			actualFetchedData = executeAndCollectWithParallel(cfg.verbose, ctx, client, mgetCmds, workerID, cycleNum)
-		}
+	case modeMGet:
+		actualFetchedData = executeAndCollectWithCrossSlotsMGet(cfg.verbose, ctx, client, keysForThisCycle, workerID, cycleNum)
 	case modeGet:
-		actualFetchedData = executeAndCollectWithMGet(cfg.verbose, ctx, client,  keysForThisCycle, workerID, cycleNum)
+		actualFetchedData = executeAndCollectWithGet(cfg.verbose, ctx, client, keysForThisCycle, workerID, cycleNum)
 	}
 
 	latency := time.Since(start)
@@ -207,8 +197,8 @@ func main() {
 	flag.BoolVar(&cfg.validate, "validate", false, "Perform data validation on each cycle")
 	flag.BoolVar(&cfg.populate, "populate", false, "Populate Valkey with random data before running tests")
 	flag.BoolVar(&cfg.readReplica, "replica", false, "Use read replica (default: false)")
-	cfg.mode = modeDoMulti
-	flag.Var(&cfg.mode, "mode", "Execution mode: 'DoMulti', 'Get', or 'Parallel'")
+	cfg.mode = modeMGet
+	flag.Var(&cfg.mode, "mode", "Execution mode: 'MGet' or 'Get'")
 	flag.Parse()
 
 	serverAddr := fmt.Sprintf("%s:%s", cfg.host, cfg.port)
@@ -226,11 +216,6 @@ func main() {
 		os.Exit(1)
 	}
 	defer client.Close()
-	csClient, ok := client.(valkey.CrossSlotClient)
-	if !ok {
-		fmt.Fprintf(os.Stderr, "FATAL: The client does not implement valkey.CrossSlotClient\n")
-		os.Exit(1)
-	}
 	fmt.Println("INFO: Valkey client connected successfully.")
 
 	allPreparedKeys := prepareKeys(cfg.prepKeys)
@@ -265,7 +250,7 @@ func main() {
 					break loop
 				default:
 					cycleNum := totalCycles.Add(1)
-					runSingleCycle(context.Background(), client, csClient, allPreparedKeys, preparedData, cfg, metrics, workerID, cycleNum)
+					runSingleCycle(context.Background(), client, allPreparedKeys, preparedData, cfg, metrics, workerID, cycleNum)
 				}
 			}
 		}(i + 1)
@@ -277,8 +262,8 @@ func main() {
 
 // --- MGET Execution and Verification Functions ---
 
-// executeAndCollectWithMGet is the wrapper for the 'MGet' mode.
-func executeAndCollectWithMGet(verbose bool, ctx context.Context, client valkey.Client, keys []string, workerID int, cycleNum int64) map[string]string {
+// executeAndCollectWithGet is the wrapper for the 'MGet' mode.
+func executeAndCollectWithGet(verbose bool, ctx context.Context, client valkey.Client, keys []string, workerID int, cycleNum int64) map[string]string {
 	if verbose {
 		fmt.Printf("[W:%d C:%d] Executing with MGet helper for %d keys...\n", workerID, cycleNum, len(keys))
 	}
@@ -313,10 +298,20 @@ type mgetJobResult struct {
 	jobError      error
 }
 
-func executeAndCollectWithDoMulti(verbose bool, ctx context.Context, client valkey.Client, mgetCmds []valkey.Completed, workerID int, cycleNum int64) map[string]string {
+func executeAndCollectWithCrossSlotsMGet(verbose bool, ctx context.Context, client valkey.Client, keys []string, workerID int, cycleNum int64) map[string]string {
 	// Renamed function, body is identical to previous executeAndCollectMGETsWithDoMulti
 	if verbose {
-		fmt.Printf("[W:%d C:%d] Executing %d MGET command(s) with DoMulti...\n", workerID, cycleNum, len(mgetCmds))
+		fmt.Printf("[W:%d C:%d] Executing MGET command(s) for %d keys ...\n", workerID, cycleNum, len(keys))
+	}
+	csClient, ok := client.(valkey.CrossSlotClient)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "[W:%d C:%d] Client does not implement valkey.CrossSlotClient interface.\n", workerID, cycleNum)
+		return nil
+	}
+	mgetCmds, err := csClient.BuildCrossSlotMGETs(ctx, keys)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[W:%d C:%d] BuildCrossSlotMGETs failed: %v\n", workerID, cycleNum, err)
+		return nil
 	}
 	actualFetchedData := make(map[string]string)
 	if len(mgetCmds) == 0 {

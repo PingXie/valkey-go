@@ -202,7 +202,6 @@ func main() {
 	flag.Parse()
 
 	serverAddr := fmt.Sprintf("%s:%s", cfg.host, cfg.port)
-	fmt.Printf("INFO: Connecting to Valkey server at: %s\n", serverAddr)
 	client, err := valkey.NewClient(valkey.ClientOption{
 		InitAddress: []string{serverAddr},
 		EnableCrossSlotMGET: true,
@@ -216,7 +215,6 @@ func main() {
 		os.Exit(1)
 	}
 	defer client.Close()
-	fmt.Println("INFO: Valkey client connected successfully.")
 
 	allPreparedKeys := prepareKeys(cfg.prepKeys)
 
@@ -242,7 +240,22 @@ func main() {
 	for i := 0; i < cfg.threads; i++ {
 		wg.Add(1)
 		go func(workerID int) {
-			defer wg.Done()
+		serverAddr := fmt.Sprintf("%s:%s", cfg.host, cfg.port)
+		tc, err := valkey.NewClient(valkey.ClientOption{
+			InitAddress: []string{serverAddr},
+			EnableCrossSlotMGET: true,
+			AllowUnstableSlotsForCrossSlotMGET: true,
+			SendToReplicas: func(cmd valkey.Completed) bool {
+				return cfg.readReplica && cmd.IsReadOnly() && rand.Float64() < 0.5
+			},
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "FATAL: Failed to create Valkey client: %v\n", err)
+			os.Exit(1)
+		}
+		defer tc.Close()
+
+		defer wg.Done()
 		loop:
 			for {
 				select {
@@ -250,7 +263,7 @@ func main() {
 					break loop
 				default:
 					cycleNum := totalCycles.Add(1)
-					runSingleCycle(context.Background(), client, allPreparedKeys, preparedData, cfg, metrics, workerID, cycleNum)
+					runSingleCycle(context.Background(), tc, allPreparedKeys, preparedData, cfg, metrics, workerID, cycleNum)
 				}
 			}
 		}(i + 1)

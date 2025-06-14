@@ -816,33 +816,53 @@ func (c *clusterClient) BuildCrossSlotMGETs(ctx context.Context, keys []string) 
 		return nil, errors.New("cross slot MGET is not enabled")
 	}
 
-	commandsMap := make(map[conn]cmds.Arbitrary)
+	// Use a constant for the maximum number of keys per MGET command for clarity and maintainability.
+	const maxKeysPerMGET = 16
 
-	// Iterate over the keys in the command
-	// 1. compute their slots
-	// 2. look up the corresponding connections
-	// 3. look up the corresponding command; if the command exists, append the key to the command as argument
-	// 4. if the command does not exist, create a new Arbitrary command with MGET as the command name and the key as argument
+	// commandsInProgress holds the command currently being built for each connection.
+	commandsInProgress := make(map[conn]cmds.Arbitrary)
+	keysInProgress := make(map[conn]int)
+	// commands holds the final list of fully built commands to be returned.
+	// The capacity is pre-allocated with a reasonable guess to minimize reallocations.
+	commands := make([]Completed, 0, len(keys)/maxKeysPerMGET+1)
+
+	// Iterate over the keys to build MGET commands.
 	for _, key := range keys {
 		slot := cmds.Slot(key)
-		// pick the connection for the slot based on the policy
 		conn := c._pick(slot, false)
 		if conn == nil {
-			// this should not happen since we already checked the slot in the pickMulti method
-			// but just in case, we return an Error
+			// This check is important, so we keep it.
 			return nil, errors.New("no connection found for the slot")
 		}
-		if _, ok := commandsMap[conn]; !ok {
-			commandsMap[conn] = c.cmd.Arbitrary("MGET")
-			commandsMap[conn].Args(key)
-		} else {
-			commandsMap[conn].Args(key)
+
+		cmd, ok := commandsInProgress[conn]
+
+		// If a command for this connection doesn't exist yet, create a new one.
+		if !ok {
+			cmd = c.cmd.Arbitrary("MGET")
+			commandsInProgress[conn] = cmd
+			keysInProgress[conn] = 0
+		}
+
+		// Add the current key to the command being built for this connection.
+		cmd.Args(key)
+		keysInProgress[conn]++
+
+		// FIX: If adding the key makes the command full, build it immediately and add it to our final list.
+		// A full command has the "MGET" part plus maxKeysPerMGET keys.
+		if keysInProgress[conn] == maxKeysPerMGET {
+			completed := cmd.Build()
+			// All keys in one MGET go to the same slot, so we can use the first key to set the slot.
+			completed = completed.SetSlot(completed.Commands()[1])
+			commands = append(commands, completed)
+			// This command is now complete, so we remove it from the in-progress map.
+			delete(commandsInProgress, conn)
+			delete(keysInProgress, conn)
 		}
 	}
 
-	// Build the commands and explicitly set the slot for each command
-	commands := make([]Completed, 0, len(commandsMap))
-	for _, cmd := range commandsMap {
+	// After the loop, build any remaining partially filled commands that are left in the map.
+	for _, cmd := range commandsInProgress {
 		completed := cmd.Build()
 		completed = completed.SetSlot(completed.Commands()[1])
 		commands = append(commands, completed)

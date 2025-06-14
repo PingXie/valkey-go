@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -26,19 +27,19 @@ const (
 type modeFlag string
 
 const (
-	modeMGet  modeFlag = "MGet"
-	modeGet   modeFlag = "Get"
+	modeMGET  modeFlag = "MGET"
+	modeGET   modeFlag = "GET"
 )
 
 func (m *modeFlag) String() string { return string(*m) }
 
 func (m *modeFlag) Set(value string) error {
 	switch value {
-	case string(modeMGet), string(modeGet):
+	case string(modeMGET), string(modeGET):
 		*m = modeFlag(value)
 		return nil
 	default:
-		return fmt.Errorf("invalid mode %q, must be one of 'MGet' or 'Get'", value)
+		return fmt.Errorf("invalid mode %q, must be one of 'MGET' or 'GET'", value)
 	}
 }
 
@@ -97,15 +98,16 @@ type config struct {
 	host        string
 	port        string
 	durationSec int
-	numKeys     int
-	prepKeys    int
-	valueLength int
+	batchSize     int
+	numkeys    int
+	dataSize int
 	threads     int
 	verbose     bool
 	mode        modeFlag
-	validate    bool
-	populate   bool
+	validate      bool
+	populate      bool
 	readReplica   bool
+	tls           bool
 }
 
 func randString(n int, seededRand *rand.Rand) string {
@@ -155,8 +157,8 @@ func prepareData(ctx context.Context, client valkey.Client, keys []string, value
 }
 
 func runSingleCycle(ctx context.Context, client valkey.Client, allPreparedKeys []string, preparedData map[string]string, cfg *config, metrics *LatencyHistogram, workerID int, cycleNum int64) {
-	keysForThisCycle := make([]string, cfg.numKeys)
-	for i := 0; i < cfg.numKeys; i++ {
+	keysForThisCycle := make([]string, cfg.batchSize)
+	for i := 0; i < cfg.batchSize; i++ {
 		keysForThisCycle[i] = allPreparedKeys[rand.Intn(len(allPreparedKeys))]
 	}
 
@@ -164,10 +166,10 @@ func runSingleCycle(ctx context.Context, client valkey.Client, allPreparedKeys [
 	start := time.Now()
 
 	switch cfg.mode {
-	case modeMGet:
-		actualFetchedData = executeAndCollectWithCrossSlotsMGet(cfg.verbose, ctx, client, keysForThisCycle, workerID, cycleNum)
-	case modeGet:
-		actualFetchedData = executeAndCollectWithGet(cfg.verbose, ctx, client, keysForThisCycle, workerID, cycleNum)
+	case modeMGET:
+		actualFetchedData = executeAndCollectWithCrossSlotsMGET(cfg.verbose, ctx, client, keysForThisCycle, workerID, cycleNum)
+	case modeGET:
+		actualFetchedData = executeAndCollectWithGET(cfg.verbose, ctx, client, keysForThisCycle, workerID, cycleNum)
 	}
 
 	latency := time.Since(start)
@@ -186,24 +188,30 @@ func runSingleCycle(ctx context.Context, client valkey.Client, allPreparedKeys [
 
 func main() {
 	cfg := &config{}
-	flag.StringVar(&cfg.host, "host", "127.0.0.1", "Valkey server host")
-	flag.StringVar(&cfg.port, "port", "6379", "Valkey server port")
-	flag.IntVar(&cfg.durationSec, "duration", 10, "Test duration in seconds")
-	flag.IntVar(&cfg.numKeys, "numkeys", 100, "Number of keys to MGET per cycle")
-	flag.IntVar(&cfg.prepKeys, "prepkeys", 10000, "Number of keys to pre-populate")
-	flag.IntVar(&cfg.valueLength, "valueLength", 1024, "Size of each value in bytes (default: 1024)")
+	flag.StringVar(&cfg.host, "host", "127.0.0.1", "Valkey server hos ")
+	flag.StringVar(&cfg.port, "port", "6379", "Valkey server porti (default: 6379)")
+	flag.IntVar(&cfg.durationSec, "duration", 10, "Test duration in seconds (default: 10)")
+	flag.IntVar(&cfg.batchSize, "batch", 100, "Number of keys to GET/MGET per batch (default: 100)")
+	flag.IntVar(&cfg.numkeys, "numKeys", 10000, "Number of keys to use in the test (default: 10000)")
+	flag.IntVar(&cfg.dataSize, "dataSize", 1024, "Size of each value in bytes (default: 1024)")
 	flag.IntVar(&cfg.threads, "threads", 4, "Number of concurrent threads to run test cycles")
 	flag.BoolVar(&cfg.verbose, "verbose", false, "Enable verbose output")
 	flag.BoolVar(&cfg.validate, "validate", false, "Perform data validation on each cycle")
 	flag.BoolVar(&cfg.populate, "populate", false, "Populate Valkey with random data before running tests")
 	flag.BoolVar(&cfg.readReplica, "replica", false, "Use read replica (default: false)")
-	cfg.mode = modeMGet
-	flag.Var(&cfg.mode, "mode", "Execution mode: 'MGet' or 'Get'")
+	flag.BoolVar(&cfg.tls, "tls", false, "Use TLS for connection (default: false)")
+	cfg.mode = modeMGET
+	flag.Var(&cfg.mode, "mode", "Execution mode: 'MGET' or 'GET'")
 	flag.Parse()
+	var tlsConfig *tls.Config = nil
+	if cfg.tls {
+		tlsConfig = &tls.Config{InsecureSkipVerify: true} // Use with caution, only for testing
+	}
 
 	serverAddr := fmt.Sprintf("%s:%s", cfg.host, cfg.port)
 	client, err := valkey.NewClient(valkey.ClientOption{
 		InitAddress: []string{serverAddr},
+		TLSConfig: tlsConfig,
 		EnableCrossSlotMGET: true,
 		AllowUnstableSlotsForCrossSlotMGET: true,
 		SendToReplicas: func(cmd valkey.Completed) bool {
@@ -216,12 +224,12 @@ func main() {
 	}
 	defer client.Close()
 
-	allPreparedKeys := prepareKeys(cfg.prepKeys)
+	allPreparedKeys := prepareKeys(cfg.numkeys)
 
 	var preparedData map[string]string
 	if cfg.populate {
 		var err error
-		preparedData, err = prepareData(context.Background(), client, allPreparedKeys, cfg.valueLength)
+		preparedData, err = prepareData(context.Background(), client, allPreparedKeys, cfg.dataSize)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "FATAL: Failed during data preparation: %v\n", err)
 			os.Exit(1)
@@ -234,7 +242,7 @@ func main() {
 
 	var wg sync.WaitGroup
 	var totalCycles atomic.Int64
-	fmt.Printf("INFO: Total keys prepared: %d, Value length: %d bytes, Number of Keys Per Batch: %d\n", len(allPreparedKeys), cfg.valueLength, cfg.numKeys)
+	fmt.Printf("INFO: Total keys prepared: %d, Value length: %d bytes, Number of Keys Per Batch: %d\n", len(allPreparedKeys), cfg.dataSize, cfg.batchSize)
 	fmt.Printf("INFO: Starting test run with mode '%s' on %d thread(s) for %d seconds...\n", cfg.mode, cfg.threads, cfg.durationSec)
 
 	for i := 0; i < cfg.threads; i++ {
@@ -243,6 +251,7 @@ func main() {
 		serverAddr := fmt.Sprintf("%s:%s", cfg.host, cfg.port)
 		tc, err := valkey.NewClient(valkey.ClientOption{
 			InitAddress: []string{serverAddr},
+			TLSConfig: tlsConfig,
 			EnableCrossSlotMGET: true,
 			AllowUnstableSlotsForCrossSlotMGET: true,
 			SendToReplicas: func(cmd valkey.Completed) bool {
@@ -273,17 +282,16 @@ func main() {
 	metrics.Print()
 }
 
-// --- MGET Execution and Verification Functions ---
-
-// executeAndCollectWithGet is the wrapper for the 'MGet' mode.
-func executeAndCollectWithGet(verbose bool, ctx context.Context, client valkey.Client, keys []string, workerID int, cycleNum int64) map[string]string {
+// executeAndCollectWithGET is the wrapper for the 'GET' mode.
+func executeAndCollectWithGET(verbose bool, ctx context.Context, client valkey.Client, keys []string, workerID int, cycleNum int64) map[string]string {
 	if verbose {
-		fmt.Printf("[W:%d C:%d] Executing with MGet helper for %d keys...\n", workerID, cycleNum, len(keys))
+		fmt.Printf("[W:%d C:%d] Executing with MGET helper for %d keys...\n", workerID, cycleNum, len(keys))
 	}
 	actualFetchedData := make(map[string]string, len(keys))
+	// MGet is the wrapper for piplined GETs
 	results, err := valkey.MGet(client, ctx, keys)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[W:%d C:%d] MGet helper returned an error: %v\n", workerID, cycleNum, err)
+		fmt.Fprintf(os.Stderr, "[W:%d C:%d] MGET helper returned an error: %v\n", workerID, cycleNum, err)
 	}
 
 	for key, msg := range results {
@@ -311,7 +319,7 @@ type mgetJobResult struct {
 	jobError      error
 }
 
-func executeAndCollectWithCrossSlotsMGet(verbose bool, ctx context.Context, client valkey.Client, keys []string, workerID int, cycleNum int64) map[string]string {
+func executeAndCollectWithCrossSlotsMGET(verbose bool, ctx context.Context, client valkey.Client, keys []string, workerID int, cycleNum int64) map[string]string {
 	// Renamed function, body is identical to previous executeAndCollectMGETsWithDoMulti
 	if verbose {
 		fmt.Printf("[W:%d C:%d] Executing MGET command(s) for %d keys ...\n", workerID, cycleNum, len(keys))
@@ -444,6 +452,10 @@ func executeAndCollectWithParallel(verbose bool, ctx context.Context, client val
 func verifyData(verbose bool, expectedKVs, actualKVs map[string]string, workerID int, cycleNum int64) {
 	if verbose {
 		fmt.Printf("[W:%d C:%d] Verifying %d keys...\n", workerID, cycleNum, len(expectedKVs))
+	}
+	if len(expectedKVs) != len(actualKVs) {
+		fmt.Fprintf(os.Stderr, "[W:%d C:%d] VERIFY FAIL: Expected %d keys, but got %d keys.\n", workerID, cycleNum, len(expectedKVs), len(actualKVs))
+		return
 	}
 	mismatches := 0
 	for expectedKey, expectedValue := range expectedKVs {

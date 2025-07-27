@@ -863,7 +863,7 @@ func (c *clusterClient) BuildCrossSlotMGETs(ctx context.Context, keys []string) 
 
 	// After the loop, build any remaining partially filled commands that are left in the map.
 	for _, cmd := range commandsInProgress {
-		completed := cmd.Build()
+		completed := cmd.ReadOnly()
 		completed = completed.SetSlot(completed.Commands()[1])
 		commands = append(commands, completed)
 	}
